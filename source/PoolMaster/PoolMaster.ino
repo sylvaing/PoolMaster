@@ -159,6 +159,15 @@ https://github.com/JChristensen/JC_Button (rev 2.1.1)
   #include "RTClib.h"
   RTC_DS3231 rtc;
 
+  #if !( defined(ARDUINO_AVR_MEGA) || defined(ARDUINO_AVR_MEGA2560) )
+  #error This code is intended to run only on the Arduino Mega 1280/2560 boards ! Please check your Tools->Board setting.
+  #endif
+  // #define EspSerial Serial3
+  #define EEPROM_START      512
+  // #include <Esp8266_AT_WM_Lite.h>
+
+
+
   #define FILTRATION_PUMP 38
   #define PH_PUMP         36
   #define CHL_PUMP        42
@@ -212,7 +221,9 @@ https://github.com/JChristensen/JC_Button (rev 2.1.1)
 #include <Queue.h>
 #include <Time.h>
 #include "Pump.h"
-#include <JC_Button.h>
+//#include <JC_Button.h>
+#include <ButtonEvents.h>
+#include <Bounce2.h>
 
 // Firmware revision
 String Firmw = "4.0.3";
@@ -240,8 +251,9 @@ const byte
     bGREEN_LED_PIN(GREEN_LED_PIN),             // Connect cathode of push button green LED to this pin. /!\ select appropriate ballast resistor in series! 
     bRED_LED_PIN(RED_LED_PIN);                 // Connect cathode of push butotn red LED to this pin. /!\ select appropriate ballast resistor in series!
 
-Button PushButton(bBUTTON_PIN);               // define the button
-bool LongPressed = false;
+ButtonEvents myButton; //create an instance of the ButtonEvents class to attach to our button
+
+bool EmergencyStopFiltPump = false;             // flag will be (re)set by double-tapp button
 bool RedPushButtonLedToggle = false;
 
 //buffers for MQTT string payload
@@ -371,6 +383,7 @@ void EthernetClientCallback(Task* me);
 void OrpRegulationCallback(Task* me);
 void PHRegulationCallback(Task* me);
 void GenericCallback(Task* me);
+void ButtonCallback(Task* me);
 void PublishDataCallback(Task* me);
 
 Task t1(500, EthernetClientCallback);         //Check for Ethernet client every 0.5 secs
@@ -378,6 +391,7 @@ Task t2(1000, OrpRegulationCallback);         //ORP regulation loop every 1 sec
 Task t3(1100, PHRegulationCallback);          //PH regulation loop every 1.1 sec
 Task t4(30000, PublishDataCallback);          //Publish data to MQTT broker every 30 secs
 Task t5(600, GenericCallback);                //Various things handled/updated in this loop every 0.6 secs
+Task t6(10, ButtonCallback);                    //Check Button every 0.01 sec (fast to detect double-tap)
 
 
 void setup()
@@ -474,6 +488,18 @@ void setup()
     //Start temperature measurement state machine
     gettemp.next(gettemp_start);
 
+    // Set status LEDS Correct at power-on
+    if(!PSIError && !PhPump.UpTimeError && !ChlPump.UpTimeError){
+      digitalWrite(bGREEN_LED_PIN, true);
+    }
+    else {
+      digitalWrite(bRED_LED_PIN, true);
+    }
+
+    //start filtration pump at power-on if within scheduled time slots -- You can choose not to do this and start pump manually
+        if(storage.AutoMode && (hour() >= storage.FiltrationStart) && (hour() < storage.FiltrationStop))
+          FiltrationPump.Start();
+    
     //Init MQTT
     MQTTClient.setOptions(60,false,10000);
     MQTTClient.setWill(PoolTopicStatus,"offline",true,LWMQTT_QOS1);
@@ -483,8 +509,26 @@ void setup()
 
    
     //Initialize the front panel push-button object
-    PushButton.begin();              
 
+    myButton.attach(PUSH_BUTTON_PIN);
+     //If your button is connected such that pressing it generates a low signal on the pin, you can specify
+    // that it is "active low", or don't bother, since this is the default setting anyway.
+    myButton.activeHigh();  
+    // By default, the raw signal on the input pin has a 35ms debounce applied to it.  You can change the
+    // debounce time if necessary.
+    myButton.debounceTime(50); //apply 50ms debounce
+    // The double-tap detection window is set to 150ms by default.  Decreasing this value will result in
+    // more responsive single-tap events, but requires really fast tapping to trigger a double-tap event.
+    // Increasing this value will allow slower taps to still trigger a double-tap event, but will make
+    // single-tap events more laggy, and can cause taps that were meant to be separate to be treated as
+    // double-taps.  The necessary timing really depends on your use case, but I have found 150ms to be a
+    // reasonable starting point.  If you need to change the double-tap detection window, you can do so
+    // as follows:
+    myButton.doubleTapTime(250); // set double-tap detection window to 250ms
+    // The hold duration can be increased to require longer holds before an event is triggered, or reduced to
+    // have hold events trigger more quickly.
+    myButton.holdTime(2000); // require button to be held for 2000ms before triggering a hold event
+ 
     //Initialize PIDs
     storage.PhPIDwindowStartTime = millis();
     storage.OrpPIDwindowStartTime = millis();
@@ -525,6 +569,8 @@ void setup()
     //Generic loop
     SoftTimer.add(&t5);
 
+    //Button loop
+    SoftTimer.add(&t6);
     //display remaining RAM space. For debug
     Serial<<F("[memCheck]: ")<<freeRam()<<F("b")<<_endl;
 }
@@ -590,27 +636,48 @@ void messageReceived(String &topic, String &payload)
   }
 }
 
-//Loop where various tasks are updated/handled
-void GenericCallback(Task* me)
+//Loop to check Button
+void ButtonCallback(Task* me)
 {
-    //clear watchdog timer
-    wdt_reset();
-    //Serial<<F("Watchdog Reset")<<_endl;
+//Read the front panel push-button
 
-    //request temp reading
-    gettemp.run();
+  // The update() method returns true if an event or state change occurred.  It serves as a passthru
+  // to the Bounce2 library update() function as well, so it will stll return true if a press/release
+  // is detected but has not triggered a tap/double-tap/hold event
+  if (myButton.update() == true) {
 
-    //Update MQTT thread
-    MQTTClient.loop(); 
+    // The event() method returns tap, doubleTap, hold or none depending on which event was detected
+    // the last time the update() method was called.  The following code accomplishes the same thing
+    // we did in the 'Basic' example, but I personally prefer this arrangement.
+    switch(myButton.event()) {
+      
+      // things to do if the button was tapped (single tap)
+      case (tap) : {
+        Serial.println("TAP event detected");  
+        LCDToggle = !LCDToggle; //toggle LCD screen
+        Serial<<F("Push-Button short press. Toggling LCD screen")<<endl;               
+        break;
+      }
 
-    //Read the front panel push-button
-    PushButton.read();
-
-    //If long press more than 2secs, clear system errors and switch push-button LED back to Green
-    if (PushButton.pressedFor(2000) & !LongPressed)    // if the button was released, change the LED state
-    {
-        LongPressed = true;
-        
+      // things to do if the button was double-tapped
+      case (doubleTap) : {
+        Serial.println("DOUBLE-TAP event detected");
+        if (FiltrationPump.IsRunning()){
+          EmergencyStopFiltPump = true;
+          FiltrationPump.Stop();  
+        }
+        else {
+          EmergencyStopFiltPump = false;
+          //start filtration pump even without scheduled time slots
+          if(storage.AutoMode && !PSIError && !PhLevelError && !ChlLevelError)
+          FiltrationPump.Start();
+        }
+        break;
+      }
+   
+      // things to do if the button was held
+      case (hold) : {
+        Serial.println("HOLD event detected");
         if(PSIError)
           PSIError = false;
             
@@ -626,22 +693,32 @@ void GenericCallback(Task* me)
         MQTTClient.publish(PoolTopicError,"",true,LWMQTT_QOS1);
 
         //start filtration pump if within scheduled time slots
-        if(storage.AutoMode && (hour() >= storage.FiltrationStart) && (hour() < storage.FiltrationStop))
+        if(!EmergencyStopFiltPump && storage.AutoMode && (hour() >= storage.FiltrationStart) && (hour() < storage.FiltrationStop))
           FiltrationPump.Start();
-    }
-
-    //Button released after short press -> toggle LCD screen
-    //Button released after long press -> reset long press
-    if(PushButton.wasReleased())
-    {
-      if(LongPressed) 
-        LongPressed = false;
-      else  
-      {    
-        LCDToggle = !LCDToggle; //toggle LCD screen
-        Serial<<F("Push-Button short press. Toggling LCD screen")<<endl;
+          PSIError = PSIError;
+        break;
       }
+      
     }
+  }    
+
+}
+
+
+//Loop where various tasks are updated/handled
+void GenericCallback(Task* me)
+{
+    //clear watchdog timer
+    wdt_reset();
+    //Serial<<F("Watchdog Reset")<<_endl;
+
+    //request temp reading
+    gettemp.run();
+
+    //Update MQTT thread
+    MQTTClient.loop(); 
+
+   
 
     //If any error flag is true, blink Red push-button LED
     if(PhPump.UpTimeError || ChlPump.UpTimeError || PSIError || !PhPump.TankLevel() || !ChlPump.TankLevel())
@@ -689,8 +766,9 @@ void GenericCallback(Task* me)
     }
 
     //start filtration pump as scheduled
-    if(storage.AutoMode && !PSIError && (hour() == storage.FiltrationStart) && (minute() == 0))
+    if(!EmergencyStopFiltPump && storage.AutoMode && !PSIError && (hour() == storage.FiltrationStart) && (minute() == 0))
         FiltrationPump.Start();
+        PSIError = PSIError;
         
     //start PIDs with delay after FiltrationStart in order to let the readings stabilize
     if(storage.AutoMode && !PhPID.GetMode() && (FiltrationPump.UpTime/1000/60 > storage.DelayPIDs) && (hour() >= storage.FiltrationStart) && (hour() < storage.FiltrationStop))
@@ -746,7 +824,7 @@ void GenericCallback(Task* me)
     }
 
     //Outside regular filtration hours, start filtration in case of cold Air temperatures (<-2.0deg)
-    if(storage.AutoMode && !PSIError && !FiltrationPump.IsRunning() && ((hour() < storage.FiltrationStart) || (hour() > storage.FiltrationStop)) && (storage.TempExternal<-2.0))
+    if(!EmergencyStopFiltPump && storage.AutoMode && !PSIError && !FiltrationPump.IsRunning() && ((hour() < storage.FiltrationStart) || (hour() > storage.FiltrationStop)) && (storage.TempExternal<-2.0))
     {
         FiltrationPump.Start();
         AntiFreezeFiltering = true;
