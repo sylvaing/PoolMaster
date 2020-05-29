@@ -513,7 +513,8 @@ void setup()
     myButton.attach(PUSH_BUTTON_PIN);
      //If your button is connected such that pressing it generates a low signal on the pin, you can specify
     // that it is "active low", or don't bother, since this is the default setting anyway.
-    myButton.activeHigh();  
+    //myButton.activeHigh();  
+    myButton.activeLow();  
     // By default, the raw signal on the input pin has a 35ms debounce applied to it.  You can change the
     // debounce time if necessary.
     myButton.debounceTime(50); //apply 50ms debounce
