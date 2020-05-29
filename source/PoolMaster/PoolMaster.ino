@@ -116,6 +116,9 @@ https://github.com/Loic74650/Pump (rev 0.0.1)
 https://github.com/PaulStoffregen/Time (rev 1.5)
 https://github.com/adafruit/RTClib (rev 1.2.0)
 https://github.com/JChristensen/JC_Button (rev 2.1.1)
+https://github.com/fasteddy516/ButtonEvents (rev 1.0.1)
+https://github.com/thomasfredericks/Bounce2 (rev 2.53.0)
+
 
 */
 
